@@ -97,7 +97,6 @@
 <div id="map"></div>
 
 <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
-<script src="https://raw.githack.com/Leaflet/Leaflet.heat/gh-pages/dist/leaflet-heat.js"></script>
 <script>
 'use strict';
 
@@ -105,20 +104,19 @@
    CONFIGURATION
 ═══════════════════════════════════════ */
 const CFG = {
-    MAX_ACC_M  : 50,      // Rejeter si précision GPS > 50 m
-    MIN_MOVE_M : 8,       // Ne pas enregistrer si déplacement < 8 m
-    HEAT_R     : 28,
-    HEAT_B     : 16,
-    HEAT_GRAD  : { 0.15:'#00e5ff', 0.4:'#00ff88', 0.65:'#ffff00', 0.85:'#ff4400', 1.0:'#ff00cc' },
-    DB         : 'neontrace_v2',
-    STORE      : 'pts',
-    MAX_RAM    : 60000,   // Points max en RAM pour le rendu (les autres restent en DB)
+    MAX_ACC_M   : 50,              // Rejeter si précision GPS > 50 m
+    MIN_MOVE_M  : 8,               // Ne pas enregistrer si déplacement < 8 m
+    SESSION_GAP : 30 * 60 * 1000, // Écart > 30 min entre deux points → nouveau segment
+    DB          : 'neontrace_v2',
+    STORE       : 'pts',
+    MAX_RAM     : 60000,           // Points max en RAM (≈ 480 km à 8 m/pt)
 };
 
 /* ═══════════════════════════════════════
    ÉTAT
 ═══════════════════════════════════════ */
-let db = null, heatPts = [], lastLL = null;
+let db = null, lastLL = null;
+let currentPts = [];               // Points de la session en cours
 let totalDist = 0, sessionStart = Date.now();
 let wakeLock = null, posMarker = null;
 
@@ -130,8 +128,15 @@ L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png', {
     attribution:'© OpenStreetMap © CartoDB', maxZoom:19
 }).addTo(map);
 
-const heat = L.heatLayer([], {
-    radius:CFG.HEAT_R, blur:CFG.HEAT_B, maxZoom:18, gradient:CFG.HEAT_GRAD
+// Tracé des sessions passées (chargé depuis IndexedDB au démarrage)
+// Légèrement transparent pour distinguer de la session en cours
+const historyLine = L.polyline([], {
+    color:'#ffcc00', weight:2, opacity:0.55, smoothFactor:1
+}).addTo(map);
+
+// Tracé de la session en cours (mis à jour en temps réel via addLatLng)
+const currentLine = L.polyline([], {
+    color:'#ffcc00', weight:2.5, opacity:1, smoothFactor:1
 }).addTo(map);
 
 const posIcon = L.divIcon({
@@ -163,6 +168,26 @@ function dbClear()  { return new Promise((res,rej)=>{ const t=dbTx('readwrite');
 function havM(a,b,c,d) {
     const R=6371000, r=Math.PI/180, da=(c-a)*r, db=(d-b)*r;
     return R*2*Math.asin(Math.sqrt(Math.sin(da/2)**2+Math.cos(a*r)*Math.cos(c*r)*Math.sin(db/2)**2));
+}
+
+/* ═══════════════════════════════════════
+   SEGMENTATION
+   Découpe un tableau de points {lat,lng,t} en segments [lat,lng][]
+   séparés dès que l'écart temporel dépasse SESSION_GAP.
+   Leaflet accepte un tableau de tableaux pour L.polyline → MultiPolyline.
+   Sans ça, la fin de la balade de lundi serait reliée au début de celle de mardi.
+═══════════════════════════════════════ */
+function buildSegments(pts) {
+    if (!pts.length) return [];
+    const segs = [];
+    let seg = [[pts[0].lat, pts[0].lng]];
+    for (let i = 1; i < pts.length; i++) {
+        const gap = (pts[i].t || 0) - (pts[i-1].t || 0);
+        if (gap > CFG.SESSION_GAP) { segs.push(seg); seg = []; }
+        seg.push([pts[i].lat, pts[i].lng]);
+    }
+    segs.push(seg);
+    return segs;
 }
 
 /* ═══════════════════════════════════════
@@ -202,10 +227,9 @@ async function onPos(pos) {
     await dbAdd({lat, lng, t:Date.now()});
     $('h-pts').textContent = (await dbCount()).toLocaleString('fr-FR');
 
-    // ── Heatmap ──
-    heatPts.push([lat, lng, 0.5]);
-    if (heatPts.length > CFG.MAX_RAM) heatPts = heatPts.slice(-CFG.MAX_RAM);
-    heat.setLatLngs(heatPts);
+    // ── Tracé en temps réel (addLatLng est incrémental : O(1), pas de recalcul) ──
+    currentPts.push([lat, lng]);
+    currentLine.addLatLng([lat, lng]);
 }
 
 function onErr(e) {
@@ -269,7 +293,8 @@ async function exportGeoJSON(){
 async function resetAll(){
     if(!confirm('Effacer définitivement tout l\'historique ?')) return;
     await dbClear();
-    heatPts=[]; heat.setLatLngs([]); lastLL=null; totalDist=0;
+    historyLine.setLatLngs([]); currentLine.setLatLngs([]);
+    currentPts=[]; lastLL=null; totalDist=0;
     $('h-pts').textContent='0'; $('h-dst').textContent='0.00 km';
     toast('DONNÉES EFFACÉES');
 }
@@ -281,22 +306,22 @@ async function init(){
     setS('waiting','OUVERTURE BASE DE DONNÉES...');
     try { db = await openDB(); } catch(e){ setS('error','ERREUR DB: '+e.message); return; }
 
-    // Chargement historique
+    // ── Chargement et reconstruction du tracé historique ──
     const stored = await dbAll();
     if (stored.length){
-        // Distance totale accumulée
+        // Distance cumulée
         for(let i=1;i<stored.length;i++)
             totalDist += havM(stored[i-1].lat,stored[i-1].lng,stored[i].lat,stored[i].lng);
 
-        // N derniers points en RAM pour affichage
-        heatPts = stored.slice(-CFG.MAX_RAM).map(p=>[p.lat,p.lng,0.5]);
-        heat.setLatLngs(heatPts);
+        // Tracé historique : segments séparés par les pauses longues
+        const work = stored.slice(-CFG.MAX_RAM);
+        historyLine.setLatLngs(buildSegments(work));
 
-        const last=stored[stored.length-1];
+        const last = stored[stored.length-1];
         map.setView([last.lat,last.lng],14);
-        lastLL={lat:last.lat,lng:last.lng};
-        $('h-pts').textContent=stored.length.toLocaleString('fr-FR');
-        $('h-dst').textContent=`${(totalDist/1000).toFixed(2)} km`;
+        lastLL = {lat:last.lat, lng:last.lng};
+        $('h-pts').textContent = stored.length.toLocaleString('fr-FR');
+        $('h-dst').textContent = `${(totalDist/1000).toFixed(2)} km`;
     }
 
     await wl();  // Demander le Wake Lock
