@@ -1,0 +1,314 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <meta name="theme-color" content="#050505">
+    <meta name="apple-mobile-web-app-capable" content="yes">
+    <meta name="mobile-web-app-capable" content="yes">
+    <title>NeonTrace v2</title>
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
+    <style>
+        *{margin:0;padding:0;box-sizing:border-box}
+        html,body{width:100%;height:100%;background:#050505;font-family:'Courier New',Courier,monospace;overflow:hidden}
+        #map{width:100%;height:100%;position:absolute;z-index:1}
+
+        /* ── HUD ── */
+        #hud{
+            position:absolute;top:14px;left:14px;z-index:10;
+            background:rgba(5,5,5,.92);border:1px solid rgba(0,255,204,.3);
+            border-radius:6px;padding:14px 16px;min-width:215px;
+            box-shadow:0 0 28px rgba(0,255,204,.1);
+            font-size:11px;letter-spacing:1.2px;text-transform:uppercase;color:#00ffcc;
+        }
+        .hud-title{font-size:13px;font-weight:bold;margin-bottom:10px;
+            text-shadow:0 0 10px rgba(0,255,204,.7);}
+        .hud-row{display:flex;justify-content:space-between;margin:3px 0;color:#557;gap:10px}
+        .hud-row .v{color:#00ffcc;white-space:nowrap}
+        .hud-sep{border:none;border-top:1px solid rgba(0,255,204,.12);margin:9px 0}
+        .hud-foot{display:flex;align-items:center;gap:8px}
+        #dot{width:8px;height:8px;border-radius:50%;background:#ffcc00;flex-shrink:0}
+        #dot.active {background:#00ffcc;animation:glow 1.5s ease-in-out infinite}
+        #dot.waiting{background:#ffcc00;animation:glow 2s   ease-in-out infinite}
+        #dot.error  {background:#ff0055;animation:glow .5s  ease-in-out infinite}
+        #stxt{font-size:10px;color:#778}
+
+        /* ── Precision badge ── */
+        #acc{
+            position:absolute;top:14px;right:14px;z-index:10;
+            background:rgba(5,5,5,.92);border:1px solid rgba(255,204,0,.3);
+            border-radius:4px;padding:6px 10px;
+            font-size:10px;color:#ffcc00;letter-spacing:1.2px;text-transform:uppercase;
+        }
+
+        /* ── Buttons ── */
+        #btns{position:absolute;bottom:18px;right:14px;z-index:10;display:flex;flex-direction:column;gap:7px}
+        .btn{
+            padding:8px 14px;font-family:'Courier New',monospace;
+            font-size:10px;text-transform:uppercase;letter-spacing:1px;
+            border-radius:4px;cursor:pointer;border:1px solid;
+            background:rgba(5,5,5,.9);transition:opacity .15s;
+        }
+        .btn:active{opacity:.4}
+        .c{color:#00ffcc;border-color:rgba(0,255,204,.45)}
+        .y{color:#ffcc00;border-color:rgba(255,204,0,.45)}
+        .r{color:#ff0055;border-color:rgba(255,0,85,.45)}
+
+        /* ── Toast ── */
+        #toast{
+            position:absolute;bottom:76px;left:50%;transform:translateX(-50%);
+            background:rgba(5,5,5,.95);border:1px solid rgba(0,255,204,.35);
+            color:#00ffcc;padding:8px 18px;border-radius:4px;
+            font-size:10px;letter-spacing:1.2px;text-transform:uppercase;
+            z-index:20;opacity:0;transition:opacity .3s;pointer-events:none;white-space:nowrap;
+        }
+        #toast.show{opacity:1}
+
+        @keyframes glow{0%,100%{opacity:.2}50%{opacity:1}}
+        .leaflet-control-attribution{background:rgba(5,5,5,.7)!important;color:#333!important}
+        .leaflet-control-attribution a{color:#444!important}
+    </style>
+</head>
+<body>
+
+<div id="hud">
+    <div class="hud-title">▶ NEONTRACE  v2</div>
+    <div class="hud-row"><span>Position</span>      <span class="v" id="h-pos">N/A</span></div>
+    <div class="hud-row"><span>Précision GPS</span> <span class="v" id="h-acc">--</span></div>
+    <div class="hud-row"><span>Points total</span>  <span class="v" id="h-pts">0</span></div>
+    <div class="hud-row"><span>Distance</span>      <span class="v" id="h-dst">0.00 km</span></div>
+    <div class="hud-row"><span>Session</span>       <span class="v" id="h-ses">00:00</span></div>
+    <hr class="hud-sep">
+    <div class="hud-foot">
+        <div id="dot" class="waiting"></div>
+        <span id="stxt">INITIALISATION...</span>
+    </div>
+</div>
+
+<div id="acc">GPS: --</div>
+<div id="toast"></div>
+
+<div id="btns">
+    <button class="btn c" onclick="centerOnMe()">⊙  MA POSITION</button>
+    <button class="btn y" onclick="exportGeoJSON()">↓  EXPORTER</button>
+    <button class="btn r" onclick="resetAll()">✕  EFFACER TOUT</button>
+</div>
+
+<div id="map"></div>
+
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script src="https://raw.githack.com/Leaflet/Leaflet.heat/gh-pages/dist/leaflet-heat.js"></script>
+<script>
+'use strict';
+
+/* ═══════════════════════════════════════
+   CONFIGURATION
+═══════════════════════════════════════ */
+const CFG = {
+    MAX_ACC_M  : 50,      // Rejeter si précision GPS > 50 m
+    MIN_MOVE_M : 8,       // Ne pas enregistrer si déplacement < 8 m
+    HEAT_R     : 28,
+    HEAT_B     : 16,
+    HEAT_GRAD  : { 0.15:'#00e5ff', 0.4:'#00ff88', 0.65:'#ffff00', 0.85:'#ff4400', 1.0:'#ff00cc' },
+    DB         : 'neontrace_v2',
+    STORE      : 'pts',
+    MAX_RAM    : 60000,   // Points max en RAM pour le rendu (les autres restent en DB)
+};
+
+/* ═══════════════════════════════════════
+   ÉTAT
+═══════════════════════════════════════ */
+let db = null, heatPts = [], lastLL = null;
+let totalDist = 0, sessionStart = Date.now();
+let wakeLock = null, posMarker = null;
+
+/* ═══════════════════════════════════════
+   CARTE
+═══════════════════════════════════════ */
+const map = L.map('map', { zoomControl:false }).setView([48.8566, 2.3522], 13);
+L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png', {
+    attribution:'© OpenStreetMap © CartoDB', maxZoom:19
+}).addTo(map);
+
+const heat = L.heatLayer([], {
+    radius:CFG.HEAT_R, blur:CFG.HEAT_B, maxZoom:18, gradient:CFG.HEAT_GRAD
+}).addTo(map);
+
+const posIcon = L.divIcon({
+    html:`<div style="width:12px;height:12px;background:#00ffcc;border-radius:50%;
+          border:2px solid #050505;box-shadow:0 0 10px #00ffcc,0 0 3px #00ffcc;"></div>`,
+    iconSize:[12,12], iconAnchor:[6,6], className:''
+});
+
+/* ═══════════════════════════════════════
+   INDEXEDDB  — stockage persistant, pas de limite pratique
+═══════════════════════════════════════ */
+function openDB() {
+    return new Promise((res,rej) => {
+        const req = indexedDB.open(CFG.DB, 1);
+        req.onupgradeneeded = e => e.target.result.createObjectStore(CFG.STORE,{autoIncrement:true});
+        req.onsuccess = e => res(e.target.result);
+        req.onerror   = e => rej(e.target.error);
+    });
+}
+function dbTx(mode) { return db.transaction(CFG.STORE, mode).objectStore(CFG.STORE); }
+function dbAdd(r)   { return new Promise((res,rej)=>{ const t=dbTx('readwrite'); t.add(r); t.transaction.oncomplete=res; t.transaction.onerror=e=>rej(e); }); }
+function dbAll()    { return new Promise((res,rej)=>{ const r=dbTx('readonly').getAll(); r.onsuccess=e=>res(e.target.result); r.onerror=e=>rej(e); }); }
+function dbCount()  { return new Promise((res,rej)=>{ const r=dbTx('readonly').count();  r.onsuccess=e=>res(e.target.result); r.onerror=e=>rej(e); }); }
+function dbClear()  { return new Promise((res,rej)=>{ const t=dbTx('readwrite'); t.clear(); t.transaction.oncomplete=res; t.transaction.onerror=e=>rej(e); }); }
+
+/* ═══════════════════════════════════════
+   GÉOMÉTRIE — formule de Haversine (mètres)
+═══════════════════════════════════════ */
+function havM(a,b,c,d) {
+    const R=6371000, r=Math.PI/180, da=(c-a)*r, db=(d-b)*r;
+    return R*2*Math.asin(Math.sqrt(Math.sin(da/2)**2+Math.cos(a*r)*Math.cos(c*r)*Math.sin(db/2)**2));
+}
+
+/* ═══════════════════════════════════════
+   GPS
+═══════════════════════════════════════ */
+async function onPos(pos) {
+    const {latitude:lat, longitude:lng, accuracy:acc} = pos.coords;
+
+    // Marqueur position courante (toujours mis à jour)
+    if (posMarker) posMarker.remove();
+    posMarker = L.marker([lat,lng],{icon:posIcon}).addTo(map);
+
+    // HUD
+    $('h-pos').textContent = `${lat.toFixed(5)}, ${lng.toFixed(5)}`;
+    $('h-acc').textContent = `±${Math.round(acc)} m`;
+    $('acc').textContent   = `GPS: ±${Math.round(acc)} m`;
+
+    // ── Filtre 1 : précision insuffisante ──
+    if (acc > CFG.MAX_ACC_M) {
+        setS('waiting', `SIGNAL FAIBLE ±${Math.round(acc)} m`);
+        return;
+    }
+    setS('active', `ENREGISTREMENT ±${Math.round(acc)} m`);
+
+    // ── Filtre 2 : déplacement minimal ──
+    if (lastLL) {
+        const d = havM(lat,lng,lastLL.lat,lastLL.lng);
+        if (d < CFG.MIN_MOVE_M) return;
+        totalDist += d;
+        $('h-dst').textContent = `${(totalDist/1000).toFixed(2)} km`;
+    } else {
+        map.setView([lat,lng], 15);  // Premier fix → centrer
+    }
+    lastLL = {lat,lng};
+
+    // ── Persistence ──
+    await dbAdd({lat, lng, t:Date.now()});
+    $('h-pts').textContent = (await dbCount()).toLocaleString('fr-FR');
+
+    // ── Heatmap ──
+    heatPts.push([lat, lng, 0.5]);
+    if (heatPts.length > CFG.MAX_RAM) heatPts = heatPts.slice(-CFG.MAX_RAM);
+    heat.setLatLngs(heatPts);
+}
+
+function onErr(e) {
+    setS('error', ({1:'PERMISSION REFUSÉE',2:'POSITION INDISPONIBLE',3:'DÉLAI DÉPASSÉ'})[e.code]??'ERREUR GPS');
+}
+
+/* ═══════════════════════════════════════
+   WAKE LOCK — maintient l'écran allumé → GPS actif
+═══════════════════════════════════════ */
+async function wl() {
+    if (!('wakeLock' in navigator)) return;
+    try {
+        wakeLock = await navigator.wakeLock.request('screen');
+        wakeLock.addEventListener('release', ()=>{ if(!document.hidden) wl(); });
+    } catch(_){}
+}
+document.addEventListener('visibilitychange', ()=>{ if(document.visibilityState==='visible') wl(); });
+
+/* ═══════════════════════════════════════
+   CHRONOMÈTRE
+═══════════════════════════════════════ */
+setInterval(()=>{
+    const s=Math.floor((Date.now()-sessionStart)/1000);
+    $('h-ses').textContent=`${String(Math.floor(s/60)).padStart(2,'0')}:${String(s%60).padStart(2,'0')}`;
+},1000);
+
+/* ═══════════════════════════════════════
+   HELPERS UI
+═══════════════════════════════════════ */
+function $(id){ return document.getElementById(id); }
+function setS(cls,msg){ $('dot').className=cls; $('stxt').textContent=msg; }
+function toast(msg,ms=2800){
+    const t=$('toast'); t.textContent=msg; t.classList.add('show');
+    setTimeout(()=>t.classList.remove('show'),ms);
+}
+
+/* ═══════════════════════════════════════
+   CONTRÔLES
+═══════════════════════════════════════ */
+function centerOnMe(){ lastLL ? map.setView([lastLL.lat,lastLL.lng],16) : toast('POSITION NON DISPONIBLE'); }
+
+async function exportGeoJSON(){
+    const all = await dbAll();
+    if (!all.length){ toast('AUCUNE DONNÉE À EXPORTER'); return; }
+    const gj = {
+        type:'FeatureCollection',
+        properties:{app:'NeonTrace v2',exported:new Date().toISOString(),count:all.length},
+        features:all.map(p=>({
+            type:'Feature',
+            geometry:{type:'Point',coordinates:[p.lng,p.lat]},
+            properties:{timestamp:p.t}
+        }))
+    };
+    const a=document.createElement('a');
+    a.href=URL.createObjectURL(new Blob([JSON.stringify(gj,null,2)],{type:'application/geo+json'}));
+    a.download=`neontrace_${new Date().toISOString().slice(0,10)}.geojson`;
+    document.body.appendChild(a); a.click(); a.remove();
+    toast(`${all.length.toLocaleString('fr-FR')} POINTS EXPORTÉS`);
+}
+
+async function resetAll(){
+    if(!confirm('Effacer définitivement tout l\'historique ?')) return;
+    await dbClear();
+    heatPts=[]; heat.setLatLngs([]); lastLL=null; totalDist=0;
+    $('h-pts').textContent='0'; $('h-dst').textContent='0.00 km';
+    toast('DONNÉES EFFACÉES');
+}
+
+/* ═══════════════════════════════════════
+   INIT
+═══════════════════════════════════════ */
+async function init(){
+    setS('waiting','OUVERTURE BASE DE DONNÉES...');
+    try { db = await openDB(); } catch(e){ setS('error','ERREUR DB: '+e.message); return; }
+
+    // Chargement historique
+    const stored = await dbAll();
+    if (stored.length){
+        // Distance totale accumulée
+        for(let i=1;i<stored.length;i++)
+            totalDist += havM(stored[i-1].lat,stored[i-1].lng,stored[i].lat,stored[i].lng);
+
+        // N derniers points en RAM pour affichage
+        heatPts = stored.slice(-CFG.MAX_RAM).map(p=>[p.lat,p.lng,0.5]);
+        heat.setLatLngs(heatPts);
+
+        const last=stored[stored.length-1];
+        map.setView([last.lat,last.lng],14);
+        lastLL={lat:last.lat,lng:last.lng};
+        $('h-pts').textContent=stored.length.toLocaleString('fr-FR');
+        $('h-dst').textContent=`${(totalDist/1000).toFixed(2)} km`;
+    }
+
+    await wl();  // Demander le Wake Lock
+
+    if(!navigator.geolocation){ setS('error','GÉOLOCALISATION NON SUPPORTÉE'); return; }
+    setS('waiting','ACQUISITION GPS...');
+    navigator.geolocation.watchPosition(onPos, onErr, {
+        enableHighAccuracy:true, maximumAge:5000, timeout:30000
+    });
+}
+
+init();
+</script>
+</body>
+</html>
