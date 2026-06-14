@@ -1,0 +1,28 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
+  <!-- Fond sombre arrondi -->
+  <rect width="512" height="512" rx="96" fill="#050505"/>
+
+  <!-- Grille légère -->
+  <line x1="0" y1="256" x2="512" y2="256" stroke="#111" stroke-width="1"/>
+  <line x1="256" y1="0" x2="256" y2="512" stroke="#111" stroke-width="1"/>
+
+  <!-- Tracé GPS jaune — forme de parcours urbain stylisé -->
+  <polyline
+    points="72,380 130,260 190,310 250,170 310,230 370,130 440,180"
+    fill="none"
+    stroke="#ffcc00"
+    stroke-width="26"
+    stroke-linecap="round"
+    stroke-linejoin="round"
+  />
+
+  <!-- Point de position courante (cyan néon) -->
+  <circle cx="440" cy="180" r="26" fill="#050505" stroke="#00ffcc" stroke-width="8"/>
+  <circle cx="440" cy="180" r="10" fill="#00ffcc"/>
+
+  <!-- Halo du point courant -->
+  <circle cx="440" cy="180" r="40" fill="none" stroke="#00ffcc" stroke-width="3" opacity="0.35"/>
+
+  <!-- Point de départ (petit) -->
+  <circle cx="72" cy="380" r="10" fill="#ffcc00" opacity="0.7"/>
+</svg>
