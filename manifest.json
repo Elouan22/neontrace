@@ -2,7 +2,7 @@
   "name": "NeonTrace",
   "short_name": "NeonTrace",
   "description": "Traceur GPS persistant — tracé en temps réel avec mémoire inter-session",
-  "start_url": "./neontrace_v3.html",
+  "start_url": "./index.html",
   "display": "standalone",
   "background_color": "#050505",
   "theme_color": "#050505",
