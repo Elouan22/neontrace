@@ -5,8 +5,12 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
     <meta name="theme-color" content="#050505">
     <meta name="apple-mobile-web-app-capable" content="yes">
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+    <meta name="apple-mobile-web-app-title" content="NeonTrace">
     <meta name="mobile-web-app-capable" content="yes">
-    <title>NeonTrace v2</title>
+    <title>NeonTrace v3</title>
+    <link rel="manifest" href="manifest.json">
+    <link rel="apple-touch-icon" href="icon.svg">
     <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
     <style>
         *{margin:0;padding:0;box-sizing:border-box}
@@ -118,6 +122,7 @@ const CFG = {
 let db = null, lastLL = null;
 let currentPts = [];               // Points de la session en cours
 let totalDist = 0, sessionStart = Date.now();
+let lastRecordTs = 0;              // Timestamp du dernier point enregistré (pour reset Kalman)
 let wakeLock = null, posMarker = null;
 
 /* ═══════════════════════════════════════
@@ -191,43 +196,106 @@ function buildSegments(pts) {
 }
 
 /* ═══════════════════════════════════════
+   FILTRE DE KALMAN 2D — lissage GPS
+   ─────────────────────────────────────
+   Modèle : position 2D (lat, lng)
+   Bruit de processus Q = (Q_MS * dt)²  [m²]
+     → Q_MS : incertitude de vitesse en m/s
+       3  = marcheur, 6 = joggeur, 15 = vélo
+   Bruit de mesure R = accuracy²        [m²]
+     → fourni par le GPS à chaque fix
+
+   Le gain K ∈ [0,1] est sans unité :
+     K→1 (bonne précision GPS) → suit le GPS
+     K→0 (mauvaise précision)  → suit la prédiction
+   Le biais en degrés/mètres n'affecte pas K,
+   qui s'applique comme un poids pur.
+═══════════════════════════════════════ */
+class KalmanGPS {
+    constructor(qMs = 3) {
+        this.Q_MS = qMs;   // m/s d'incertitude de vitesse
+        this.P    = -1;    // variance d'état en m² (-1 = non initialisé)
+        this.lat  = 0;
+        this.lng  = 0;
+        this.ts   = 0;
+    }
+
+    filter(lat, lng, accM, tsMs) {
+        if (this.P < 0) {
+            // Initialisation sur le premier fix valide
+            this.lat = lat; this.lng = lng;
+            this.P   = accM * accM;
+            this.ts  = tsMs;
+            return { lat, lng };
+        }
+
+        const dt = Math.max((tsMs - this.ts) / 1000, 0.001); // secondes
+        this.ts = tsMs;
+
+        // ── Prédiction : la variance croît avec le temps (le sujet peut se déplacer) ──
+        this.P += this.Q_MS * this.Q_MS * dt * dt;
+
+        // ── Mise à jour Kalman ──
+        const R = accM * accM;                // bruit de mesure (m²)
+        const K = this.P / (this.P + R);      // gain [0,1], sans unité → applicable en degrés
+        this.lat += K * (lat - this.lat);
+        this.lng += K * (lng - this.lng);
+        this.P   = (1 - K) * this.P;
+
+        return { lat: this.lat, lng: this.lng };
+    }
+
+    reset() { this.P = -1; }
+}
+
+const kalman = new KalmanGPS(3);   // 3 m/s → adapté à la marche / course à pied
+
+/* ═══════════════════════════════════════
    GPS
 ═══════════════════════════════════════ */
 async function onPos(pos) {
-    const {latitude:lat, longitude:lng, accuracy:acc} = pos.coords;
+    const {latitude:rawLat, longitude:rawLng, accuracy:acc} = pos.coords;
+    const now = Date.now();
 
-    // Marqueur position courante (toujours mis à jour)
+    // Marqueur et HUD sur la position brute (plus réactive visuellement)
     if (posMarker) posMarker.remove();
-    posMarker = L.marker([lat,lng],{icon:posIcon}).addTo(map);
-
-    // HUD
-    $('h-pos').textContent = `${lat.toFixed(5)}, ${lng.toFixed(5)}`;
+    posMarker = L.marker([rawLat,rawLng],{icon:posIcon}).addTo(map);
+    $('h-pos').textContent = `${rawLat.toFixed(5)}, ${rawLng.toFixed(5)}`;
     $('h-acc').textContent = `±${Math.round(acc)} m`;
     $('acc').textContent   = `GPS: ±${Math.round(acc)} m`;
 
-    // ── Filtre 1 : précision insuffisante ──
+    // ── Filtre 1 : précision insuffisante → on ne passe pas au Kalman ──
     if (acc > CFG.MAX_ACC_M) {
         setS('waiting', `SIGNAL FAIBLE ±${Math.round(acc)} m`);
         return;
     }
     setS('active', `ENREGISTREMENT ±${Math.round(acc)} m`);
 
-    // ── Filtre 2 : déplacement minimal ──
+    // ── Reset Kalman si longue pause (nouvelle session) ──
+    if (lastRecordTs > 0 && (now - lastRecordTs) > CFG.SESSION_GAP) {
+        kalman.reset();
+    }
+
+    // ── Filtrage Kalman : acc pondère la confiance envers le GPS ──
+    const { lat, lng } = kalman.filter(rawLat, rawLng, acc, now);
+
+    // ── Filtre 2 : déplacement minimal sur les coords filtrées ──
     if (lastLL) {
         const d = havM(lat,lng,lastLL.lat,lastLL.lng);
         if (d < CFG.MIN_MOVE_M) return;
         totalDist += d;
         $('h-dst').textContent = `${(totalDist/1000).toFixed(2)} km`;
     } else {
-        map.setView([lat,lng], 15);  // Premier fix → centrer
+        map.setView([lat,lng], 15);
     }
     lastLL = {lat,lng};
+    lastRecordTs = now;
 
-    // ── Persistence ──
-    await dbAdd({lat, lng, t:Date.now()});
+    // ── Persistence (coordonnées filtrées) ──
+    await dbAdd({lat, lng, t:now});
     $('h-pts').textContent = (await dbCount()).toLocaleString('fr-FR');
 
-    // ── Tracé en temps réel (addLatLng est incrémental : O(1), pas de recalcul) ──
+    // ── Tracé (addLatLng : O(1), pas de recalcul complet) ──
     currentPts.push([lat, lng]);
     currentLine.addLatLng([lat, lng]);
 }
@@ -294,7 +362,8 @@ async function resetAll(){
     if(!confirm('Effacer définitivement tout l\'historique ?')) return;
     await dbClear();
     historyLine.setLatLngs([]); currentLine.setLatLngs([]);
-    currentPts=[]; lastLL=null; totalDist=0;
+    currentPts=[]; lastLL=null; totalDist=0; lastRecordTs=0;
+    kalman.reset();
     $('h-pts').textContent='0'; $('h-dst').textContent='0.00 km';
     toast('DONNÉES EFFACÉES');
 }
@@ -330,6 +399,16 @@ async function init(){
     setS('waiting','ACQUISITION GPS...');
     navigator.geolocation.watchPosition(onPos, onErr, {
         enableHighAccuracy:true, maximumAge:5000, timeout:30000
+    });
+}
+
+/* ═══════════════════════════════════════
+   SERVICE WORKER — PWA offline + cache tiles
+═══════════════════════════════════════ */
+if ('serviceWorker' in navigator) {
+    window.addEventListener('load', () => {
+        navigator.serviceWorker.register('./sw.js')
+            .catch(e => console.warn('SW registration failed:', e));
     });
 }
 
