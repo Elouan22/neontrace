@@ -17,7 +17,7 @@ const MAX_TILES  = 1500;   // ~30 MB sur AVIF/WebP, ~60 MB sur PNG
 
 /* Ressources pré-cachées à l'installation */
 const APP_SHELL = [
-    './neontrace_v3.html',
+    './index.html',
     './manifest.json',
     './icon.svg',
     'https://unpkg.com/leaflet@1.9.4/dist/leaflet.css',
